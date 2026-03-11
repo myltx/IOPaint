@@ -8,6 +8,7 @@ import {
 } from "react"
 import { CursorArrowRaysIcon } from "@heroicons/react/24/outline"
 import { useToast } from "@/components/ui/use-toast"
+import { ToastAction } from "@/components/ui/toast"
 import {
   ReactZoomPanPinchContentRef,
   TransformComponent,
@@ -28,6 +29,11 @@ import {
   mouseXY,
   srcToFile,
 } from "@/lib/utils"
+import {
+  getDesktopRuntimeInfo,
+  openDesktopOutputDir,
+} from "@/lib/desktopBridge"
+import { getPreferredLocale, t } from "@/lib/locale"
 import {
   ChevronsLeftRight,
   Eraser,
@@ -581,8 +587,27 @@ export default function Editor(props: EditorProps) {
           file.name,
           file.type
         )
+        const runtimeInfo = await getDesktopRuntimeInfo()
+        const outputDir = runtimeInfo?.outputDir ?? null
+        const locale = getPreferredLocale()
+        const savedPath = outputDir
+          ? `${outputDir.replace(/\/$/, "")}/${file.name}`
+          : file.name
         toast({
-          description: "Save image success",
+          title: t(locale, "保存成功", "Save image success"),
+          description: outputDir
+            ? t(locale, `已保存到：${savedPath}`, `Saved to: ${savedPath}`)
+            : t(locale, "保存成功", "Save image success"),
+          action: outputDir ? (
+            <ToastAction
+              altText={t(locale, "打开输出目录", "Open output folder")}
+              onClick={() => {
+                void openDesktopOutputDir()
+              }}
+            >
+              {t(locale, "打开目录", "Open folder")}
+            </ToastAction>
+          ) : undefined,
         })
       } catch (e: any) {
         toast({

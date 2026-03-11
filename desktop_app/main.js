@@ -1,6 +1,6 @@
 "use strict";
 
-const { app, BrowserWindow, dialog, Menu, shell } = require("electron");
+const { app, BrowserWindow, dialog, Menu, shell, ipcMain } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const net = require("net");
@@ -103,7 +103,7 @@ function getDataPaths() {
   const logDir = path.join(dataDir, "logs");
   const settingsFile = path.join(dataDir, "settings.json");
   const settings = readSettings(settingsFile);
-  const defaultOutputDir = path.join(app.getPath("pictures"), "IOPaint-output");
+  const defaultOutputDir = getDefaultOutputDir();
   const outputDir = settings.outputDir || defaultOutputDir;
   ensureDir(modelDir);
   ensureDir(outputDir);
@@ -112,6 +112,203 @@ function getDataPaths() {
     writeSettings(settingsFile, { ...settings, outputDir });
   }
   return { dataDir, modelDir, outputDir, logDir, settingsFile };
+}
+
+function getDefaultOutputDir() {
+  return path.join(app.getPath("pictures"), "IOPaint-output");
+}
+
+function getModelCheckpointPath(modelDir) {
+  return path.join(modelDir, "torch", "hub", "checkpoints", "big-lama.pt");
+}
+
+function assertWritableDir(dirPath, label) {
+  ensureDir(dirPath);
+  const probe = path.join(
+    dirPath,
+    `.iopaint-write-check-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  );
+  try {
+    fs.writeFileSync(probe, "ok");
+    fs.unlinkSync(probe);
+  } catch (err) {
+    throw new Error(
+      `${label} 不可写: ${dirPath}\n` +
+      `请检查目录权限，或在菜单里切换到可写目录。`
+    );
+  }
+}
+
+function resolvePython(paths) {
+  const runtimePythonPath = path.join(paths.backendRuntime, "bin", "python3");
+  const fallbackPythonPath = "/usr/bin/python3";
+  const runtimeSitePackages = findRuntimeSitePackages(paths.backendRuntime);
+
+  if (isPythonUsable(runtimePythonPath)) {
+    return {
+      pythonPath: runtimePythonPath,
+      runtimePythonPath,
+      fallbackPythonPath,
+      runtimeSitePackages,
+      usingFallback: false
+    };
+  }
+
+  if (isPythonUsable(fallbackPythonPath)) {
+    return {
+      pythonPath: fallbackPythonPath,
+      runtimePythonPath,
+      fallbackPythonPath,
+      runtimeSitePackages,
+      usingFallback: true
+    };
+  }
+
+  throw new Error(
+    `Python runtime not found or unusable:\n` +
+    `- bundled: ${runtimePythonPath}\n` +
+    `- fallback: ${fallbackPythonPath}`
+  );
+}
+
+function buildPythonEnv(paths, dataPaths, runtimeSitePackages) {
+  return {
+    ...process.env,
+    PYTHONNOUSERSITE: "1",
+    PYTHONPATH: runtimeSitePackages
+      ? `${paths.backendSrc}:${runtimeSitePackages}`
+      : paths.backendSrc,
+    HF_HOME: dataPaths.modelDir,
+    TRANSFORMERS_CACHE: dataPaths.modelDir,
+    XDG_CACHE_HOME: dataPaths.modelDir
+  };
+}
+
+function runStartupPreflight(paths, dataPaths) {
+  const mainPy = path.join(paths.backendSrc, "main.py");
+  if (!fs.existsSync(mainPy)) {
+    throw new Error(`后端入口不存在: ${mainPy}`);
+  }
+
+  assertWritableDir(dataPaths.modelDir, "模型目录");
+  assertWritableDir(dataPaths.outputDir, "输出目录");
+  assertWritableDir(dataPaths.logDir, "日志目录");
+
+  const modelPath = getModelCheckpointPath(dataPaths.modelDir);
+  if (!fs.existsSync(modelPath)) {
+    throw new Error(
+      `未找到必需模型: ${modelPath}\n` +
+      `请重新打包并确保已内置 big-lama.pt，或手动复制到该路径。`
+    );
+  }
+
+  const python = resolvePython(paths);
+  const env = buildPythonEnv(paths, dataPaths, python.runtimeSitePackages);
+  const smoke = spawnSync(
+    python.pythonPath,
+    ["-c", "import fastapi,uvicorn,torch,loguru,iopaint;print('ok')"],
+    {
+      cwd: paths.backendSrc,
+      env,
+      encoding: "utf8"
+    }
+  );
+  if (smoke.status !== 0) {
+    const output = `${smoke.stdout || ""}\n${smoke.stderr || ""}`.trim();
+    throw new Error(
+      `Python 依赖自检失败（${python.pythonPath}）\n` +
+      (output ? `${output}\n` : "") +
+      `请使用最新 dmg 重新安装，或重新打包 runtime。`
+    );
+  }
+
+  return python;
+}
+
+function inferBackendHint(tail) {
+  const text = tail || "";
+  if (/No such option:\s+--disable-model-switch/i.test(text)) {
+    return "当前后端版本不支持 --disable-model-switch，已自动兼容；请确认使用最新打包产物。";
+  }
+  if (/No module named/i.test(text)) {
+    return "Python 依赖缺失。请重新打包 runtime，或使用包含 runtime 的最新 dmg。";
+  }
+  if (/Permission denied|Errno 13/i.test(text)) {
+    return "目录权限不足。请检查输出目录/模型目录权限，必要时切换到用户目录。";
+  }
+  if (/Address already in use/i.test(text)) {
+    return "端口被占用。请关闭旧的 IOPaint 进程后重试。";
+  }
+  if (/big-lama\.pt|No such file.*checkpoints/i.test(text)) {
+    return "模型文件缺失。请确认 big-lama.pt 已内置或已复制到模型目录。";
+  }
+  return "";
+}
+
+function buildBackendErrorMessage(prefix, logFile, tail) {
+  const hint = inferBackendHint(tail);
+  return (
+    `${prefix}\n` +
+    (hint ? `建议：${hint}\n\n` : "") +
+    `日志：${logFile}\n\n` +
+    (tail ? `--- last 50 lines ---\n${tail}` : "")
+  );
+}
+
+function scanDirSummary(rootDir, maxRecentFiles = 8) {
+  const result = {
+    path: rootDir,
+    exists: fs.existsSync(rootDir),
+    fileCount: 0,
+    dirCount: 0,
+    totalBytes: 0,
+    recentFiles: []
+  };
+  if (!result.exists) {
+    return result;
+  }
+
+  const stack = [rootDir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch (err) {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        result.dirCount += 1;
+        stack.push(fullPath);
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+
+      result.fileCount += 1;
+      let stat = null;
+      try {
+        stat = fs.statSync(fullPath);
+      } catch (err) {
+        continue;
+      }
+      result.totalBytes += stat.size;
+      result.recentFiles.push({
+        name: entry.name,
+        path: fullPath,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs
+      });
+    }
+  }
+
+  result.recentFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  result.recentFiles = result.recentFiles.slice(0, maxRecentFiles);
+  return result;
 }
 
 function tailFile(logFile, maxLines = 50, maxBytes = 65536) {
@@ -190,23 +387,9 @@ function waitForServer(port) {
 }
 
 function startBackend(port, paths, dataPaths) {
-  const runtimePythonPath = path.join(paths.backendRuntime, "bin", "python3");
-  const fallbackPythonPath = "/usr/bin/python3";
-  const runtimeSitePackages = findRuntimeSitePackages(paths.backendRuntime);
-  const pythonPath = isPythonUsable(runtimePythonPath)
-    ? runtimePythonPath
-    : fallbackPythonPath;
+  const python = runStartupPreflight(paths, dataPaths);
+  const pythonPath = python.pythonPath;
   const mainPy = path.join(paths.backendSrc, "main.py");
-
-  if (!isPythonUsable(pythonPath)) {
-    throw new Error(
-      `Python runtime not found or unusable: ${runtimePythonPath}. ` +
-      `Fallback also failed: ${fallbackPythonPath}`
-    );
-  }
-  if (!fs.existsSync(mainPy)) {
-    throw new Error(`Backend entry not found: ${mainPy}`);
-  }
 
   const args = [
     mainPy,
@@ -248,16 +431,7 @@ function startBackend(port, paths, dataPaths) {
   const logFile = path.join(dataPaths.logDir, "backend.log");
   const logStream = fs.createWriteStream(logFile, { flags: "a" });
 
-  const env = {
-    ...process.env,
-    PYTHONNOUSERSITE: "1",
-    PYTHONPATH: runtimeSitePackages
-      ? `${paths.backendSrc}:${runtimeSitePackages}`
-      : paths.backendSrc,
-    HF_HOME: dataPaths.modelDir,
-    TRANSFORMERS_CACHE: dataPaths.modelDir,
-    XDG_CACHE_HOME: dataPaths.modelDir
-  };
+  const env = buildPythonEnv(paths, dataPaths, python.runtimeSitePackages);
 
   const proc = spawn(pythonPath, args, {
     cwd: paths.backendSrc,
@@ -278,17 +452,19 @@ function startBackend(port, paths, dataPaths) {
     }
     if (code !== 0 && code !== null) {
       const tail = tailFile(logFile);
-      const message =
-        `Backend exited with code ${code}.\n` +
-        `Log: ${logFile}\n\n` +
-        (tail ? `--- last 50 lines ---\n${tail}` : "");
+      const message = buildBackendErrorMessage(
+        `Backend exited with code ${code}.`,
+        logFile,
+        tail
+      );
       dialog.showErrorBox(`${APP_NAME} backend error`, message);
     } else if (code === null) {
       const tail = tailFile(logFile);
-      const message =
-        `Backend exited (signal).\n` +
-        `Log: ${logFile}\n\n` +
-        (tail ? `--- last 50 lines ---\n${tail}` : "");
+      const message = buildBackendErrorMessage(
+        "Backend exited (signal).",
+        logFile,
+        tail
+      );
       dialog.showErrorBox(`${APP_NAME} backend error`, message);
     }
   });
@@ -330,26 +506,90 @@ async function restartBackend() {
 
 function openOutputDir() {
   if (!dataPaths?.outputDir) {
-    return;
+    return Promise.resolve("Output directory not configured");
   }
   ensureDir(dataPaths.outputDir);
-  shell.openPath(dataPaths.outputDir);
+  return shell.openPath(dataPaths.outputDir);
 }
 
-function showOutputDir() {
-  if (!dataPaths?.outputDir) {
-    return;
+function openDataDir() {
+  if (!dataPaths?.dataDir) {
+    return Promise.resolve("Data directory not configured");
   }
-  const choice = dialog.showMessageBoxSync({
-    type: "info",
-    buttons: ["打开", "关闭"],
-    defaultId: 0,
-    message: "当前下载目录",
-    detail: dataPaths.outputDir
+  ensureDir(dataPaths.dataDir);
+  return shell.openPath(dataPaths.dataDir);
+}
+
+async function selectOutputDirAndRestart() {
+  if (!dataPaths) {
+    throw new Error("Data paths not initialized");
+  }
+  const result = await dialog.showOpenDialog({
+    title: "选择输出目录",
+    properties: ["openDirectory", "createDirectory"]
   });
-  if (choice === 0) {
-    openOutputDir();
+  if (result.canceled || !result.filePaths.length) {
+    return { canceled: true };
   }
+
+  const selected = result.filePaths[0];
+  ensureDir(selected);
+  const settings = readSettings(dataPaths.settingsFile);
+  writeSettings(dataPaths.settingsFile, {
+    ...settings,
+    outputDir: selected
+  });
+  dataPaths.outputDir = selected;
+  await restartBackend();
+  return { canceled: false, selected };
+}
+
+function clearLogFiles() {
+  if (!dataPaths?.logDir) {
+    throw new Error("Log directory not configured");
+  }
+  ensureDir(dataPaths.logDir);
+  const entries = fs.readdirSync(dataPaths.logDir);
+  for (const entry of entries) {
+    const fullPath = path.join(dataPaths.logDir, entry);
+    if (backendProc && entry === "backend.log" && fs.existsSync(fullPath)) {
+      fs.truncateSync(fullPath, 0);
+      continue;
+    }
+    fs.rmSync(fullPath, { recursive: true, force: true });
+  }
+}
+
+async function clearModelCacheAndRestart() {
+  if (!dataPaths) {
+    throw new Error("Data paths not initialized");
+  }
+  stopBackend();
+  removeDirSafe(dataPaths.modelDir, dataPaths.dataDir);
+  ensureDir(dataPaths.modelDir);
+  const paths = resolveBackendPaths();
+  copyBundledModelIfNeeded(paths.bundledModel, dataPaths.modelDir);
+  await restartBackend();
+}
+
+function resetSettingsToDefaultOutput() {
+  if (!dataPaths) {
+    throw new Error("Data paths not initialized");
+  }
+  const defaultOutputDir = getDefaultOutputDir();
+  ensureDir(defaultOutputDir);
+  const settings = readSettings(dataPaths.settingsFile);
+  writeSettings(dataPaths.settingsFile, {
+    ...settings,
+    outputDir: defaultOutputDir
+  });
+  dataPaths.outputDir = defaultOutputDir;
+}
+
+async function clearAllAppDataAndRestart() {
+  clearLogFiles();
+  resetSettingsToDefaultOutput();
+  await clearModelCacheAndRestart();
 }
 
 function createWindow() {
@@ -392,92 +632,116 @@ function createAppMenu() {
     {
       label: APP_NAME,
       submenu: [
-        {
-          label: "设置输出目录...",
-          click: async () => {
-            if (!dataPaths) {
-              return;
-            }
-            const result = await dialog.showOpenDialog({
-              title: "选择输出目录",
-              properties: ["openDirectory", "createDirectory"]
-            });
-            if (result.canceled || !result.filePaths.length) {
-              return;
-            }
-            const selected = result.filePaths[0];
-            ensureDir(selected);
-            const settings = readSettings(dataPaths.settingsFile);
-            writeSettings(dataPaths.settingsFile, {
-              ...settings,
-              outputDir: selected
-            });
-            dataPaths.outputDir = selected;
-            const choice = dialog.showMessageBoxSync({
-              type: "question",
-              buttons: ["立即重启", "稍后"],
-              defaultId: 0,
-              message: "已更新输出目录，需重启后端生效。",
-              detail: selected
-            });
-            if (choice === 0) {
-              try {
-                await restartBackend();
-              } catch (err) {
-                dialog.showErrorBox(
-                  `${APP_NAME} 重启失败`,
-                  String(err)
-                );
-              }
-            }
-          }
-        },
-        {
-          label: "显示下载目录",
-          click: () => {
-            showOutputDir();
-          }
-        },
-        {
-          label: "打开下载目录",
-          click: () => {
-            openOutputDir();
-          }
-        },
-        {
-          label: "清理模型缓存",
-          click: async () => {
-            if (!dataPaths) {
-              return;
-            }
-            const choice = dialog.showMessageBoxSync({
-              type: "warning",
-              buttons: ["取消", "清理并重启"],
-              defaultId: 1,
-              cancelId: 0,
-              message: "确认清理模型缓存？",
-              detail: "这会删除已下载的模型文件，应用将重启。"
-            });
-            if (choice !== 1) {
-              return;
-            }
-            try {
-              stopBackend();
-              removeDirSafe(dataPaths.modelDir, dataPaths.dataDir);
-              ensureDir(dataPaths.modelDir);
-              await restartBackend();
-            } catch (err) {
-              dialog.showErrorBox(`${APP_NAME} 清理失败`, String(err));
-            }
-          }
-        },
-        { type: "separator" },
         { role: "quit" }
       ]
     }
   ];
   const menu = Menu.buildFromTemplate(template);
   Menu.setApplicationMenu(menu);
+}
+
+function registerIpcHandlers() {
+  ipcMain.handle("desktop:get-runtime-info", () => {
+    if (!dataPaths) {
+      return {
+        isDesktop: true,
+        outputDir: null,
+        dataDir: null,
+        logDir: null,
+        modelDir: null
+      };
+    }
+    return {
+      isDesktop: true,
+      outputDir: dataPaths.outputDir,
+      dataDir: dataPaths.dataDir,
+      logDir: dataPaths.logDir,
+      modelDir: dataPaths.modelDir
+    };
+  });
+
+  ipcMain.handle("desktop:get-data-overview", () => {
+    if (!dataPaths) {
+      return {
+        ok: false,
+        error: "Data paths not initialized"
+      };
+    }
+    try {
+      const outputSummary = scanDirSummary(dataPaths.outputDir);
+      const logSummary = scanDirSummary(dataPaths.logDir);
+      const modelSummary = scanDirSummary(dataPaths.modelDir);
+      return {
+        ok: true,
+        overview: {
+          paths: {
+            outputDir: dataPaths.outputDir,
+            dataDir: dataPaths.dataDir,
+            logDir: dataPaths.logDir,
+            modelDir: dataPaths.modelDir
+          },
+          output: outputSummary,
+          logs: logSummary,
+          models: modelSummary
+        }
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: String(err)
+      };
+    }
+  });
+
+  ipcMain.handle("desktop:open-output-dir", async () => {
+    try {
+      const error = await openOutputDir();
+      return { ok: !error, error: error || null };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
+
+  ipcMain.handle("desktop:select-output-dir", async () => {
+    try {
+      const result = await selectOutputDirAndRestart();
+      if (result.canceled) {
+        return { ok: false, canceled: true };
+      }
+      return { ok: true, selected: result.selected, restarted: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
+
+  ipcMain.handle("desktop:open-data-dir", async () => {
+    try {
+      const error = await openDataDir();
+      return { ok: !error, error: error || null };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
+
+  ipcMain.handle("desktop:cleanup", async (_event, target) => {
+    try {
+      if (target === "logs") {
+        clearLogFiles();
+        return { ok: true };
+      }
+      if (target === "models") {
+        await clearModelCacheAndRestart();
+        return { ok: true, restarted: true };
+      }
+      if (target === "all") {
+        await clearAllAppDataAndRestart();
+        return { ok: true, restarted: true };
+      }
+      return { ok: false, error: `Unknown cleanup target: ${target}` };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
 }
 
 async function boot() {
@@ -489,19 +753,19 @@ async function boot() {
   createAppMenu();
 
   backendPort = await getFreePort();
-  startBackend(backendPort, paths, dataPaths);
 
   try {
+    startBackend(backendPort, paths, dataPaths);
     await waitForServer(backendPort);
     const url = `http://${DEFAULT_HOST}:${backendPort}`;
     await mainWindow.loadURL(url);
   } catch (err) {
     const logFile = path.join(dataPaths.logDir, "backend.log");
     const tail = tailFile(logFile);
+    const detail = err instanceof Error ? `${err.message}\n\n` : "";
     dialog.showErrorBox(
       `${APP_NAME} 启动失败`,
-      `后端服务未能启动。\n日志：${logFile}\n\n` +
-        (tail ? `--- last 50 lines ---\n${tail}` : "")
+      detail + buildBackendErrorMessage("后端服务未能启动。", logFile, tail)
     );
   }
 }
@@ -515,6 +779,7 @@ app.on("window-all-closed", () => {
 });
 
 app.whenReady().then(() => {
+  registerIpcHandlers();
   boot().catch((err) => {
     dialog.showErrorBox(`${APP_NAME} 启动失败`, String(err));
     app.quit();

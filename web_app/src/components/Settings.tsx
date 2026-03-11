@@ -23,6 +23,24 @@ import { useQuery } from "@tanstack/react-query"
 import { getServerConfig, switchModel, switchPluginModel } from "@/lib/api"
 import { ModelInfo, PluginName } from "@/lib/types"
 import { useStore } from "@/lib/states"
+import {
+  cleanupDesktopData,
+  DesktopCleanupTarget,
+  DesktopDataOverview,
+  DesktopRuntimeInfo,
+  getDesktopDataOverview,
+  getDesktopRuntimeInfo,
+  isDesktopBridgeAvailable,
+  openDesktopDataDir,
+  openDesktopOutputDir,
+  selectDesktopOutputDir,
+} from "@/lib/desktopBridge"
+import {
+  AppLocale,
+  getPreferredLocale,
+  setPreferredLocale,
+  t,
+} from "@/lib/locale"
 import { ScrollArea } from "./ui/scroll-area"
 import { useToast } from "./ui/use-toast"
 import {
@@ -61,12 +79,34 @@ const formSchema = z.object({
   interactiveSegModel: z.string(),
 })
 
-const TAB_GENERAL = "General"
-const TAB_MODEL = "Model"
-const TAB_PLUGINS = "Plugins"
-// const TAB_FILE_MANAGER = "File Manager"
+const TAB_GENERAL = "general"
+const TAB_MODEL = "model"
+const TAB_PLUGINS = "plugins"
+const TAB_DATA = "data"
 
-const TAB_NAMES = [TAB_MODEL, TAB_GENERAL, TAB_PLUGINS]
+const BASE_TAB_NAMES = [TAB_MODEL, TAB_GENERAL, TAB_PLUGINS]
+
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B"
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"]
+  let value = bytes
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  const fixed = value >= 100 || unitIndex === 0 ? 0 : 1
+  return `${value.toFixed(fixed)} ${units[unitIndex]}`
+}
+
+function formatDateTime(ms: number) {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return "-"
+  }
+  return new Date(ms).toLocaleString()
+}
 
 export function SettingsDialog() {
   const [open, toggleOpen] = useToggle(false)
@@ -89,6 +129,19 @@ export function SettingsDialog() {
   const { toast } = useToast()
   const [model, setModel] = useState<ModelInfo>(settings.model)
   const [modelSwitchingTexts, setModelSwitchingTexts] = useState<string[]>([])
+  const [desktopRuntimeInfo, setDesktopRuntimeInfo] =
+    useState<DesktopRuntimeInfo | null>(null)
+  const [desktopDataOverview, setDesktopDataOverview] =
+    useState<DesktopDataOverview | null>(null)
+  const [isLoadingDesktopData, setIsLoadingDesktopData] = useState(false)
+  const [desktopBusyAction, setDesktopBusyAction] = useState<
+    DesktopCleanupTarget | "open_output" | "open_data" | "set_output" | null
+  >(null)
+  const [locale, setLocale] = useState<AppLocale>(() => getPreferredLocale())
+  const desktopSupported = isDesktopBridgeAvailable()
+  const tabNames = desktopSupported
+    ? [...BASE_TAB_NAMES, TAB_DATA]
+    : BASE_TAB_NAMES
   const openModelSwitching = modelSwitchingTexts.length > 0
   useEffect(() => {
     setModel(settings.model)
@@ -127,6 +180,69 @@ export function SettingsDialog() {
       form.setValue("interactiveSegModel", serverConfig.interactiveSegModel)
     }
   }, [form, serverConfig])
+
+  useEffect(() => {
+    if (!desktopSupported) {
+      setDesktopRuntimeInfo(null)
+      setDesktopDataOverview(null)
+      return
+    }
+    let cancelled = false
+    setIsLoadingDesktopData(true)
+    Promise.all([getDesktopRuntimeInfo(), getDesktopDataOverview()])
+      .then(([runtimeInfo, overviewResult]) => {
+        if (cancelled) {
+          return
+        }
+        setDesktopRuntimeInfo(runtimeInfo)
+        if (overviewResult.ok && overviewResult.overview) {
+          setDesktopDataOverview(overviewResult.overview)
+        } else {
+          setDesktopDataOverview(null)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setDesktopRuntimeInfo(null)
+          setDesktopDataOverview(null)
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsLoadingDesktopData(false)
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [desktopSupported, open])
+
+  useEffect(() => {
+    if (!desktopSupported && tab === TAB_DATA) {
+      setTab(TAB_MODEL)
+    }
+  }, [desktopSupported, tab])
+
+  function tabLabel(tabName: string) {
+    if (tabName === TAB_MODEL) {
+      return t(locale, "模型", "Model")
+    }
+    if (tabName === TAB_GENERAL) {
+      return t(locale, "通用", "General")
+    }
+    if (tabName === TAB_PLUGINS) {
+      return t(locale, "插件", "Plugins")
+    }
+    if (tabName === TAB_DATA) {
+      return t(locale, "数据", "Data")
+    }
+    return tabName
+  }
+
+  function changeLocale(nextLocale: AppLocale) {
+    setLocale(nextLocale)
+    setPreferredLocale(nextLocale)
+  }
 
   async function onSubmit(values: z.infer<typeof formSchema>) {
     // Do something with the form values. ✅ This will be type-safe and validated.
@@ -395,19 +511,173 @@ export function SettingsDialog() {
     )
   }
 
+  const isDesktopRuntime = Boolean(desktopRuntimeInfo?.isDesktop)
+
+  async function refreshDesktopInfo() {
+    if (!desktopSupported) {
+      setDesktopRuntimeInfo(null)
+      setDesktopDataOverview(null)
+      return
+    }
+    setIsLoadingDesktopData(true)
+    try {
+      const [runtimeInfo, overviewResult] = await Promise.all([
+        getDesktopRuntimeInfo(),
+        getDesktopDataOverview(),
+      ])
+      setDesktopRuntimeInfo(runtimeInfo)
+      if (overviewResult.ok && overviewResult.overview) {
+        setDesktopDataOverview(overviewResult.overview)
+      } else {
+        setDesktopDataOverview(null)
+      }
+    } catch {
+      setDesktopRuntimeInfo(null)
+      setDesktopDataOverview(null)
+    } finally {
+      setIsLoadingDesktopData(false)
+    }
+  }
+
+  async function handleDesktopOpen(kind: "open_output" | "open_data") {
+    setDesktopBusyAction(kind)
+    try {
+      const result =
+        kind === "open_output"
+          ? await openDesktopOutputDir()
+          : await openDesktopDataDir()
+      if (!result.ok) {
+        throw new Error(result.error || "Failed to open directory")
+      }
+    } catch (error: any) {
+      toast({
+        variant: "destructive",
+        title: t(locale, "桌面操作失败", "Desktop action failed"),
+        description: error?.message ? error.message : String(error),
+      })
+    } finally {
+      setDesktopBusyAction(null)
+    }
+  }
+
+  async function handleDesktopSetOutputDir() {
+    setDesktopBusyAction("set_output")
+    try {
+      const result = await selectDesktopOutputDir()
+      if (result.canceled) {
+        return
+      }
+      if (!result.ok) {
+        throw new Error(result.error || "Failed to set output directory")
+      }
+      toast({
+        title: t(locale, "输出目录已更新", "Output directory updated"),
+        description: result.selected
+          ? t(
+              locale,
+              `新目录：${result.selected}`,
+              `New directory: ${result.selected}`
+            )
+          : undefined,
+      })
+      await refreshDesktopInfo()
+    } catch (error: any) {
+      toast({
+        variant: "destructive",
+        title: t(locale, "设置输出目录失败", "Failed to set output directory"),
+        description: error?.message ? error.message : String(error),
+      })
+    } finally {
+      setDesktopBusyAction(null)
+    }
+  }
+
+  async function handleDesktopCleanup(target: DesktopCleanupTarget) {
+    const message =
+      target === "logs"
+        ? t(locale, "确认清理日志？", "Confirm clear logs?")
+        : target === "models"
+        ? t(
+            locale,
+            "确认清理模型缓存并重启后端？",
+            "Confirm clear model cache and restart backend?"
+          )
+        : t(
+            locale,
+            "确认清理全部应用数据并重启后端？",
+            "Confirm clear app data and restart backend?"
+          )
+    if (!window.confirm(message)) {
+      return
+    }
+
+    setDesktopBusyAction(target)
+    try {
+      const result = await cleanupDesktopData(target)
+      if (!result.ok) {
+        throw new Error(result.error || "Cleanup failed")
+      }
+      toast({
+        title:
+          target === "logs"
+            ? t(locale, "日志已清理", "Logs cleared")
+            : target === "models"
+            ? t(locale, "模型缓存已清理", "Model cache cleared")
+            : t(locale, "应用数据已清理", "App data cleared"),
+        description: result.restarted
+          ? t(locale, "后端已重启。", "Backend restarted successfully.")
+          : undefined,
+      })
+      await refreshDesktopInfo()
+    } catch (error: any) {
+      toast({
+        variant: "destructive",
+        title: t(locale, "清理失败", "Cleanup failed"),
+        description: error?.message ? error.message : String(error),
+      })
+    } finally {
+      setDesktopBusyAction(null)
+    }
+  }
+
   function renderGeneralSettings() {
     return (
       <div className="space-y-4 w-[510px]">
+        <div className="space-y-2">
+          <FormLabel>{t(locale, "语言", "Language")}</FormLabel>
+          <Select
+            value={locale}
+            onValueChange={(value) => {
+              changeLocale(value as AppLocale)
+            }}
+          >
+            <SelectTrigger className="w-[220px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent align="start">
+              <SelectItem value="zh-CN">简体中文</SelectItem>
+              <SelectItem value="en-US">English</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <Separator />
+
         <FormField
           control={form.control}
           name="enableManualInpainting"
           render={({ field }) => (
             <FormItem className="flex items-center justify-between">
               <div className="space-y-0.5">
-                <FormLabel>Enable manual inpainting</FormLabel>
+                <FormLabel>
+                  {t(locale, "启用手动触发擦除", "Enable manual inpainting")}
+                </FormLabel>
                 <FormDescription>
-                  For erase model, click a button to trigger inpainting after
-                  draw mask.
+                  {t(
+                    locale,
+                    "擦除模型下，绘制蒙版后点击按钮再执行生成。",
+                    "For erase model, click a button to trigger inpainting after draw mask."
+                  )}
                 </FormDescription>
               </div>
               <FormControl>
@@ -428,9 +698,15 @@ export function SettingsDialog() {
           render={({ field }) => (
             <FormItem className="flex items-center justify-between">
               <div className="space-y-0.5">
-                <FormLabel>Enable download mask</FormLabel>
+                <FormLabel>
+                  {t(locale, "同时下载蒙版", "Enable download mask")}
+                </FormLabel>
                 <FormDescription>
-                  Also download the mask after save the inpainting result.
+                  {t(
+                    locale,
+                    "保存修复结果时，同时下载蒙版图。",
+                    "Also download the mask after save the inpainting result."
+                  )}
                 </FormDescription>
               </div>
               <FormControl>
@@ -451,10 +727,15 @@ export function SettingsDialog() {
           render={({ field }) => (
             <FormItem className="flex items-center justify-between">
               <div className="space-y-0.5">
-                <FormLabel>Enable auto extract prompt</FormLabel>
+                <FormLabel>
+                  {t(locale, "自动提取提示词", "Enable auto extract prompt")}
+                </FormLabel>
                 <FormDescription>
-                  Automatically extract prompt/negativate prompt from the image
-                  meta.
+                  {t(
+                    locale,
+                    "自动从图片元数据提取 prompt / negative prompt。",
+                    "Automatically extract prompt/negative prompt from image metadata."
+                  )}
                 </FormDescription>
               </div>
               <FormControl>
@@ -466,6 +747,108 @@ export function SettingsDialog() {
             </FormItem>
           )}
         />
+
+        {isDesktopRuntime ? (
+          <>
+            <Separator />
+
+            <div className="space-y-2">
+              <div className="font-medium">{t(locale, "目录与数据操作", "Directory & Data Actions")}</div>
+              <div className="text-xs text-muted-foreground">
+                {t(
+                  locale,
+                  "1) 设置输出目录：切换保存路径，并自动重启后端以立即生效。",
+                  "1) Set Output Directory: switch save path and restart backend to take effect."
+                )}
+              </div>
+              <div className="text-xs text-muted-foreground">
+                {t(
+                  locale,
+                  "2) 清理日志：仅删除日志文件，不影响模型或导出图片。",
+                  "2) Clear Logs: remove log files only, no model/image loss."
+                )}
+              </div>
+              <div className="text-xs text-muted-foreground">
+                {t(
+                  locale,
+                  "3) 清理模型缓存：删除已缓存模型并重启后端，下次使用可能重新加载模型。",
+                  "3) Clear Model Cache: delete cached models, backend restarts, model may reload on next use."
+                )}
+              </div>
+              <div className="text-xs text-muted-foreground">
+                {t(
+                  locale,
+                  "4) 清理全部应用数据：清理日志+模型缓存，并将输出路径重置默认；你已导出的图片不会删除。",
+                  "4) Clear All App Data: clear logs + model cache and reset output path to default; your exported images are kept."
+                )}
+              </div>
+              <div className="flex flex-wrap gap-2 pt-1">
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={desktopBusyAction !== null}
+                  onClick={() => {
+                    void handleDesktopSetOutputDir()
+                  }}
+                >
+                  {t(locale, "设置输出目录", "Set Output Directory")}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={desktopBusyAction !== null}
+                  onClick={() => {
+                    void handleDesktopOpen("open_output")
+                  }}
+                >
+                  {t(locale, "打开输出目录", "Open Output Folder")}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={desktopBusyAction !== null}
+                  onClick={() => {
+                    void handleDesktopOpen("open_data")
+                  }}
+                >
+                  {t(locale, "打开数据目录", "Open Data Folder")}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={desktopBusyAction !== null}
+                  onClick={() => {
+                    void handleDesktopCleanup("logs")
+                  }}
+                >
+                  {t(locale, "清理日志", "Clear Logs")}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={desktopBusyAction !== null}
+                  onClick={() => {
+                    void handleDesktopCleanup("models")
+                  }}
+                >
+                  {t(locale, "清理模型缓存", "Clear Model Cache")}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={desktopBusyAction !== null}
+                  onClick={() => {
+                    void handleDesktopCleanup("all")
+                  }}
+                >
+                  {t(locale, "清理全部应用数据", "Clear All App Data")}
+                </Button>
+              </div>
+            </div>
+          </>
+        ) : (
+          <></>
+        )}
 
         {/* <FormField
           control={form.control}
@@ -488,6 +871,132 @@ export function SettingsDialog() {
           )}
         />
         <Separator /> */}
+      </div>
+    )
+  }
+
+  function renderDataSettings() {
+    if (!desktopSupported || !isDesktopRuntime) {
+      return (
+        <div className="w-[510px] space-y-2">
+          <div className="font-medium">{t(locale, "桌面数据", "Desktop Data")}</div>
+          <div className="text-sm text-muted-foreground">
+            {t(
+              locale,
+              "仅桌面版应用支持数据管理。",
+              "Data management is available in desktop app only."
+            )}
+          </div>
+        </div>
+      )
+    }
+
+    const overview = desktopDataOverview
+
+    const renderSummaryCard = (
+      title: string,
+      summary:
+        | {
+            path: string
+            fileCount: number
+            dirCount: number
+            totalBytes: number
+            recentFiles: { name: string; size: number; mtimeMs: number }[]
+          }
+        | undefined
+    ) => {
+      return (
+        <div className="rounded-md border p-3 space-y-2">
+          <div className="font-medium">{title}</div>
+          <div className="text-xs text-muted-foreground break-all">
+            {summary?.path || "-"}
+          </div>
+          <div className="text-xs text-muted-foreground">
+            {`${t(locale, "文件", "Files")}: ${summary?.fileCount ?? 0} | ${t(
+              locale,
+              "目录",
+              "Folders"
+            )}: ${
+              summary?.dirCount ?? 0
+            } | ${t(locale, "大小", "Size")}: ${formatBytes(
+              summary?.totalBytes ?? 0
+            )}`}
+          </div>
+          <div className="space-y-1">
+            <div className="text-xs font-medium">
+              {t(locale, "最近文件", "Recent files")}
+            </div>
+            {summary?.recentFiles && summary.recentFiles.length > 0 ? (
+              summary.recentFiles.slice(0, 5).map((file) => (
+                <div
+                  key={`${title}-${file.name}-${file.mtimeMs}`}
+                  className="text-xs text-muted-foreground truncate"
+                  title={file.name}
+                >
+                  {`${file.name} · ${formatBytes(file.size)} · ${formatDateTime(
+                    file.mtimeMs
+                  )}`}
+                </div>
+              ))
+            ) : (
+              <div className="text-xs text-muted-foreground">
+                {t(locale, "暂无文件", "No files")}
+              </div>
+            )}
+          </div>
+        </div>
+      )
+    }
+
+    return (
+      <div className="space-y-4 w-[510px]">
+        <div className="space-y-1">
+          <div className="font-medium">
+            {t(locale, "桌面数据中心", "Desktop Data Center")}
+          </div>
+          <div className="text-sm text-muted-foreground">
+            {t(
+              locale,
+              "查看当前数据占用，并在明确后果说明下执行清理。",
+              "View current data usage and perform cleanup with clear consequences."
+            )}
+          </div>
+          <div className="text-xs text-muted-foreground break-all">
+            {t(locale, "应用数据根目录", "App Data Root")}：{" "}
+            {overview?.paths.dataDir || desktopRuntimeInfo?.dataDir || "-"}
+          </div>
+        </div>
+
+        {isLoadingDesktopData ? (
+          <div className="text-sm text-muted-foreground">
+            {t(locale, "正在加载数据概览...", "Loading data overview...")}
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {renderSummaryCard(
+              t(locale, "输出目录", "Output Directory"),
+              overview?.output
+            )}
+            {renderSummaryCard(
+              t(locale, "模型缓存", "Model Cache"),
+              overview?.models
+            )}
+            {renderSummaryCard(t(locale, "日志目录", "Logs"), overview?.logs)}
+          </div>
+        )}
+
+        <div className="pt-1">
+          <Button
+            type="button"
+            variant="ghost"
+            disabled={desktopBusyAction !== null || isLoadingDesktopData}
+            onClick={() => {
+              void refreshDesktopInfo()
+            }}
+          >
+            {t(locale, "刷新", "Refresh")}
+          </Button>
+        </div>
       </div>
     )
   }
@@ -708,22 +1217,22 @@ export function SettingsDialog() {
       </AlertDialog>
       <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogTrigger asChild>
-          <IconButton tooltip="Settings">
+          <IconButton tooltip={t(locale, "设置", "Settings")}>
             <Settings />
           </IconButton>
         </DialogTrigger>
         <DialogContent
-          className="max-w-3xl h-[600px]"
+          className="max-w-3xl h-[600px] flex flex-col overflow-hidden"
           // onEscapeKeyDown={(event) => event.preventDefault()}
           onOpenAutoFocus={(event) => event.preventDefault()}
           // onPointerDownOutside={(event) => event.preventDefault()}
         >
-          <DialogTitle>Settings</DialogTitle>
+          <DialogTitle>{t(locale, "设置", "Settings")}</DialogTitle>
           <Separator />
 
-          <div className="flex flex-row space-x-8 h-full">
-            <div className="flex flex-col space-y-1">
-              {TAB_NAMES.map((item) => (
+          <div className="flex flex-1 min-h-0 flex-row space-x-8">
+            <div className="flex shrink-0 flex-col space-y-1">
+              {tabNames.map((item) => (
                 <Button
                   key={item}
                   variant="ghost"
@@ -733,28 +1242,36 @@ export function SettingsDialog() {
                     "justify-start"
                   )}
                 >
-                  {item}
+                  {tabLabel(item)}
                 </Button>
               ))}
             </div>
             <Separator orientation="vertical" />
             <Form {...form}>
-              <div className="flex w-full justify-center">
-                <form onSubmit={form.handleSubmit(onSubmit)}>
-                  {tab === TAB_MODEL ? renderModelSettings() : <></>}
-                  {tab === TAB_GENERAL ? renderGeneralSettings() : <></>}
-                  {tab === TAB_PLUGINS ? renderPluginsSettings() : <></>}
-                  {/* {tab === TAB_FILE_MANAGER ? (
-                    renderFileManagerSettings()
-                  ) : (
-                    <></>
-                  )} */}
-
-                  <div className="absolute right-10 bottom-6">
-                    <Button onClick={() => onOpenChange(false)}>Ok</Button>
+              <form
+                className="flex flex-1 min-h-0 flex-col"
+                onSubmit={form.handleSubmit(onSubmit)}
+              >
+                <div className="min-h-0 flex-1 overflow-y-auto pr-2">
+                  <div className="mx-auto w-full max-w-[540px]">
+                    {tab === TAB_MODEL ? renderModelSettings() : <></>}
+                    {tab === TAB_GENERAL ? renderGeneralSettings() : <></>}
+                    {tab === TAB_PLUGINS ? renderPluginsSettings() : <></>}
+                    {tab === TAB_DATA ? renderDataSettings() : <></>}
+                    {/* {tab === TAB_FILE_MANAGER ? (
+                      renderFileManagerSettings()
+                    ) : (
+                      <></>
+                    )} */}
                   </div>
-                </form>
-              </div>
+                </div>
+
+                <div className="pt-4 flex justify-end">
+                  <Button onClick={() => onOpenChange(false)}>
+                    {t(locale, "确定", "Ok")}
+                  </Button>
+                </div>
+              </form>
             </Form>
           </div>
         </DialogContent>
