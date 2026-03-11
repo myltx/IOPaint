@@ -1,4 +1,11 @@
-import { SyntheticEvent, useCallback, useEffect, useRef, useState } from "react"
+import {
+  PointerEvent as ReactPointerEvent,
+  SyntheticEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react"
 import { CursorArrowRaysIcon } from "@heroicons/react/24/outline"
 import { useToast } from "@/components/ui/use-toast"
 import {
@@ -21,7 +28,15 @@ import {
   mouseXY,
   srcToFile,
 } from "@/lib/utils"
-import { Eraser, Eye, Redo, Undo, Expand, Download } from "lucide-react"
+import {
+  ChevronsLeftRight,
+  Eraser,
+  Eye,
+  Redo,
+  Undo,
+  Expand,
+  Download,
+} from "lucide-react"
 import { useImage } from "@/hooks/useImage"
 import { Slider } from "./ui/slider"
 import { PluginName } from "@/lib/types"
@@ -37,8 +52,6 @@ import {
 } from "@/lib/const"
 
 const TOOLBAR_HEIGHT = 200
-const COMPARE_SLIDER_DURATION_MS = 300
-
 interface EditorProps {
   file: File
 }
@@ -107,7 +120,6 @@ export default function Editor(props: EditorProps) {
   const curLineGroup = useStore((state) => state.editorState.curLineGroup)
 
   // Local State
-  const [showOriginal, setShowOriginal] = useState(false)
   const [original, isOriginalLoaded] = useImage(file)
   const [context, setContext] = useState<CanvasRenderingContext2D>()
   const [imageContext, setImageContext] = useState<CanvasRenderingContext2D>()
@@ -127,9 +139,41 @@ export default function Editor(props: EditorProps) {
 
   const [isDraging, setIsDraging] = useState(false)
 
-  const [sliderPos, setSliderPos] = useState<number>(0)
+  const [isCompareMode, setIsCompareMode] = useState(false)
+  const [comparePos, setComparePos] = useState<number>(50)
+  const [isDraggingCompare, setIsDraggingCompare] = useState(false)
+  const compareContainerRef = useRef<HTMLDivElement | null>(null)
   const [isChangingBrushSizeByWheel, setIsChangingBrushSizeByWheel] =
     useState<boolean>(false)
+
+  const clampComparePos = useCallback((value: number) => {
+    if (Number.isNaN(value)) {
+      return 50
+    }
+    return Math.min(100, Math.max(0, value))
+  }, [])
+
+  const updateComparePosFromClientX = useCallback(
+    (clientX: number) => {
+      const rect = compareContainerRef.current?.getBoundingClientRect()
+      if (!rect || rect.width === 0) {
+        return
+      }
+      const nextPos = ((clientX - rect.left) / rect.width) * 100
+      setComparePos(clampComparePos(nextPos))
+    },
+    [clampComparePos]
+  )
+
+  const handleCompareHandlePointerDown = useCallback(
+    (ev: ReactPointerEvent<HTMLDivElement>) => {
+      ev.preventDefault()
+      ev.stopPropagation()
+      setIsDraggingCompare(true)
+      updateComparePosFromClientX(ev.clientX)
+    },
+    [updateComparePosFromClientX]
+  )
 
   const hadDrawSomething = useCallback(() => {
     return curLineGroup.length !== 0
@@ -361,6 +405,9 @@ export default function Editor(props: EditorProps) {
     if (isProcessing) {
       return
     }
+    if (isCompareMode) {
+      return
+    }
 
     if (interactiveSegState.isInteractiveSeg) {
       return
@@ -405,6 +452,9 @@ export default function Editor(props: EditorProps) {
   }
 
   const onPointerUp = (ev: SyntheticEvent) => {
+    if (isCompareMode) {
+      return
+    }
     if (isMidClick(ev)) {
       setIsPanning(false)
       return
@@ -440,6 +490,9 @@ export default function Editor(props: EditorProps) {
   }
 
   const onCanvasMouseUp = (ev: SyntheticEvent) => {
+    if (isCompareMode) {
+      return
+    }
     if (interactiveSegState.isInteractiveSeg) {
       const xy = mouseXY(ev)
       const newClicks: number[][] = [...interactiveSegState.clicks]
@@ -455,6 +508,9 @@ export default function Editor(props: EditorProps) {
 
   const onMouseDown = (ev: SyntheticEvent) => {
     if (isProcessing) {
+      return
+    }
+    if (isCompareMode) {
       return
     }
     if (interactiveSegState.isInteractiveSeg) {
@@ -502,24 +558,14 @@ export default function Editor(props: EditorProps) {
       ev?.preventDefault()
       ev?.stopPropagation()
       if (hadRunInpainting()) {
-        setShowOriginal(() => {
-          window.setTimeout(() => {
-            setSliderPos(100)
-          }, 10)
-          return true
-        })
+        setIsCompareMode(true)
       }
     },
     (ev) => {
       ev?.preventDefault()
       ev?.stopPropagation()
       if (hadRunInpainting()) {
-        window.setTimeout(() => {
-          setSliderPos(0)
-        }, 10)
-        window.setTimeout(() => {
-          setShowOriginal(false)
-        }, COMPARE_SLIDER_DURATION_MS)
+        setIsCompareMode(false)
       }
     }
   )
@@ -579,13 +625,21 @@ export default function Editor(props: EditorProps) {
   useHotKey("meta+s,ctrl+s", download)
 
   const toggleShowBrush = (newState: boolean) => {
-    if (newState !== showBrush && !isPanning && !isCropperExtenderResizing) {
+    if (
+      newState !== showBrush &&
+      !isPanning &&
+      !isCropperExtenderResizing &&
+      !isCompareMode
+    ) {
       setShowBrush(newState)
     }
   }
 
   const getCursor = useCallback(() => {
     if (isProcessing) {
+      return "default"
+    }
+    if (isCompareMode) {
       return "default"
     }
     if (isPanning) {
@@ -595,7 +649,16 @@ export default function Editor(props: EditorProps) {
       return "none"
     }
     return undefined
-  }, [showBrush, isPanning, isProcessing])
+  }, [showBrush, isPanning, isProcessing, isCompareMode])
+
+  useEffect(() => {
+    if (!isCompareMode) {
+      return
+    }
+    setShowBrush(false)
+    setShowRefBrush(false)
+    setIsDraging(false)
+  }, [isCompareMode])
 
   useHotKey(
     "[",
@@ -681,6 +744,28 @@ export default function Editor(props: EditorProps) {
     }
   }, [])
 
+  useEffect(() => {
+    if (!isDraggingCompare) {
+      return
+    }
+
+    const handlePointerMove = (ev: PointerEvent) => {
+      updateComparePosFromClientX(ev.clientX)
+    }
+
+    const handlePointerUp = () => {
+      setIsDraggingCompare(false)
+    }
+
+    window.addEventListener("pointermove", handlePointerMove)
+    window.addEventListener("pointerup", handlePointerUp)
+
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove)
+      window.removeEventListener("pointerup", handlePointerUp)
+    }
+  }, [isDraggingCompare, updateComparePosFromClientX])
+
   useKeyPressEvent(
     SHORTCUT_KEY_CHANGE_BRUSH_SIZE,
     (ev) => {
@@ -754,6 +839,11 @@ export default function Editor(props: EditorProps) {
   }
 
   const renderCanvas = () => {
+    const editedClipPath = isCompareMode
+      ? `inset(0 0 0 ${comparePos}%)`
+      : undefined
+    const originalClipPath = `inset(0 ${100 - comparePos}% 0 0)`
+
     return (
       <TransformWrapper
         ref={(r) => {
@@ -784,12 +874,14 @@ export default function Editor(props: EditorProps) {
             visibility: initialCentered ? "visible" : "hidden",
           }}
         >
-          <div className="grid [grid-template-areas:'editor-content'] gap-y-4">
+          <div
+            ref={compareContainerRef}
+            className="grid [grid-template-areas:'editor-content'] gap-y-4"
+          >
             <canvas
               className="[grid-area:editor-content]"
               style={{
-                clipPath: `inset(0 ${sliderPos}% 0 0)`,
-                transition: `clip-path ${COMPARE_SLIDER_DURATION_MS}ms`,
+                clipPath: editedClipPath,
               }}
               ref={(r) => {
                 if (r && !imageContext) {
@@ -809,8 +901,7 @@ export default function Editor(props: EditorProps) {
               )}
               style={{
                 cursor: getCursor(),
-                clipPath: `inset(0 ${sliderPos}% 0 0)`,
-                transition: `clip-path ${COMPARE_SLIDER_DURATION_MS}ms`,
+                clipPath: editedClipPath,
               }}
               onContextMenu={(e) => {
                 e.preventDefault()
@@ -837,21 +928,27 @@ export default function Editor(props: EditorProps) {
               }}
             />
             <div
-              className="[grid-area:editor-content] pointer-events-none grid [grid-template-areas:'original-image-content']"
+              className="[grid-area:editor-content] pointer-events-none grid [grid-template-areas:'original-image-content'] relative"
               style={{
                 width: `${imageWidth}px`,
                 height: `${imageHeight}px`,
               }}
             >
-              {showOriginal && (
+              {isCompareMode && (
                 <>
                   <div
-                    className="[grid-area:original-image-content] z-10 bg-primary h-full w-[6px] justify-self-end"
+                    className="[grid-area:original-image-content] z-20 h-full w-10 pointer-events-auto absolute top-0 cursor-col-resize group"
                     style={{
-                      marginRight: `${sliderPos}%`,
-                      transition: `margin-right ${COMPARE_SLIDER_DURATION_MS}ms`,
+                      left: `${comparePos}%`,
+                      transform: "translateX(-50%)",
                     }}
-                  />
+                    onPointerDown={handleCompareHandlePointerDown}
+                  >
+                    <div className="absolute left-1/2 top-0 h-full w-[3px] -translate-x-1/2 bg-primary/90 shadow-[0_0_14px_rgba(59,130,246,0.5)] group-hover:shadow-[0_0_20px_rgba(59,130,246,0.7)] transition-shadow" />
+                    <div className="absolute left-1/2 top-1/2 h-[30px] w-[30px] -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-primary bg-background/95 shadow-[0_0_10px_rgba(59,130,246,0.35)] group-hover:scale-110 group-hover:shadow-[0_0_16px_rgba(59,130,246,0.65)] transition-all flex items-center justify-center">
+                      <ChevronsLeftRight className="h-4 w-4 text-primary" />
+                    </div>
+                  </div>
                   <img
                     className="[grid-area:original-image-content]"
                     src={original.src}
@@ -859,6 +956,7 @@ export default function Editor(props: EditorProps) {
                     style={{
                       width: `${imageWidth}px`,
                       height: `${imageHeight}px`,
+                      clipPath: originalClipPath,
                     }}
                   />
                 </>
@@ -920,6 +1018,7 @@ export default function Editor(props: EditorProps) {
       {showBrush &&
         !isInpainting &&
         !isPanning &&
+        !isCompareMode &&
         (interactiveSegState.isInteractiveSeg
           ? renderInteractiveSegCursor()
           : renderBrush(getBrushStyle(x, y)))}
@@ -961,25 +1060,9 @@ export default function Editor(props: EditorProps) {
             <Redo />
           </IconButton>
           <IconButton
-            tooltip="Show original image"
-            onPointerDown={(ev) => {
-              ev.preventDefault()
-              setShowOriginal(() => {
-                window.setTimeout(() => {
-                  setSliderPos(100)
-                }, 10)
-                return true
-              })
-            }}
-            onPointerUp={() => {
-              window.setTimeout(() => {
-                // 防止快速点击 show original image 按钮时图片消失
-                setSliderPos(0)
-              }, 10)
-
-              window.setTimeout(() => {
-                setShowOriginal(false)
-              }, COMPARE_SLIDER_DURATION_MS)
+            tooltip="Toggle before/after compare"
+            onClick={() => {
+              setIsCompareMode((prev) => !prev)
             }}
             disabled={renders.length === 0}
           >

@@ -5,7 +5,7 @@ APP_NAME="${APP_NAME:-IOPaint}"
 APP_VERSION="${APP_VERSION:-1.0.1}"
 PRELOAD_LAMA_MODEL_PATH="${PRELOAD_LAMA_MODEL_PATH:-}"
 BUNDLE_RUNTIME="${BUNDLE_RUNTIME:-1}"
-RUNTIME_MODE="${RUNTIME_MODE:-copies-v1}"
+RUNTIME_MODE="${RUNTIME_MODE:-auto-v1}"
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WEB_DIR="${ROOT_DIR}/web_app"
@@ -15,6 +15,7 @@ BACKEND_SRC_DIR="${BACKEND_DIR}/src"
 BACKEND_RUNTIME_DIR="${BACKEND_DIR}/runtime"
 BACKEND_MODELS_DIR="${BACKEND_DIR}/preload_models"
 DIST_DIR="${ROOT_DIR}/dist"
+ELECTRON_OUT_DIR="${DESKTOP_DIR}/dist_electron"
 
 log() {
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
@@ -25,6 +26,16 @@ require_cmd() {
     echo "Error: missing command '$1'" >&2
     exit 1
   fi
+}
+
+clean_dir_contents() {
+  local target="$1"
+  if [[ ! -d "${target}" ]]; then
+    mkdir -p "${target}"
+    return
+  fi
+  # Keep directory itself, remove all children to avoid occasional macOS rmdir errors.
+  find "${target}" -mindepth 1 -maxdepth 1 -exec /bin/rm -rf {} + 2>/dev/null || true
 }
 
 assert_env() {
@@ -75,7 +86,7 @@ bundle_runtime() {
     local runtime_mode
     runtime_version="$(cat "${BACKEND_RUNTIME_DIR}/.bundle_version")"
     runtime_mode="$(cat "${BACKEND_RUNTIME_DIR}/.runtime_mode")"
-    if [[ "${runtime_version}" == "${APP_VERSION}" && "${runtime_mode}" == "${RUNTIME_MODE}" ]]; then
+    if [[ "${runtime_version}" == "${APP_VERSION}" ]]; then
       if "${BACKEND_RUNTIME_DIR}/bin/python3" -c "import sys" >/dev/null 2>&1; then
         log "Reuse bundled python runtime (${runtime_version}, ${runtime_mode})"
         return
@@ -85,11 +96,19 @@ bundle_runtime() {
 
   log "Build bundled python runtime (${RUNTIME_MODE})"
   rm -rf "${BACKEND_RUNTIME_DIR}"
-  /usr/bin/python3 -m venv --copies "${BACKEND_RUNTIME_DIR}"
+
+  local runtime_mode_actual="symlink-v1"
+  if /usr/bin/python3 -m venv --copies "${BACKEND_RUNTIME_DIR}" >/dev/null 2>&1; then
+    runtime_mode_actual="copies-v1"
+  else
+    log "Python venv --copies unsupported, fallback to symlink mode"
+    /usr/bin/python3 -m venv "${BACKEND_RUNTIME_DIR}"
+  fi
+
   "${BACKEND_RUNTIME_DIR}/bin/python3" -m pip install -U pip
   "${BACKEND_RUNTIME_DIR}/bin/pip" install -r "${BACKEND_SRC_DIR}/requirements.txt"
   printf '%s\n' "${APP_VERSION}" > "${BACKEND_RUNTIME_DIR}/.bundle_version"
-  printf '%s\n' "${RUNTIME_MODE}" > "${BACKEND_RUNTIME_DIR}/.runtime_mode"
+  printf '%s\n' "${runtime_mode_actual}" > "${BACKEND_RUNTIME_DIR}/.runtime_mode"
 }
 
 bundle_preload_model() {
@@ -128,6 +147,7 @@ build_electron() {
 main() {
   assert_env
   mkdir -p "${DIST_DIR}"
+  clean_dir_contents "${ELECTRON_OUT_DIR}"
   build_web
   prepare_backend
   bundle_runtime
