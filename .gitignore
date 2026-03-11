@@ -10,3 +10,6 @@ IOPaint.egg-info/
 venv/
 tmp/
 iopaint/web_app/
+desktop_app/node_modules/
+desktop_app/dist_electron/
+desktop_app/backend/

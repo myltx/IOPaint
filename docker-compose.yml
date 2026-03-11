@@ -1,0 +1,32 @@
+services:
+  iopaint:
+    image: ${IOPAINT_IMAGE:-iopaint:cpu}
+    pull_policy: never
+    container_name: ${IOPAINT_CONTAINER_NAME:-iopaint}
+    restart: unless-stopped
+    mem_limit: ${IOPAINT_MEM_LIMIT:-1200m}
+    memswap_limit: ${IOPAINT_MEMSWAP_LIMIT:-2g}
+    cpus: ${IOPAINT_CPUS:-1.20}
+    shm_size: ${IOPAINT_SHM_SIZE:-256m}
+    pids_limit: ${IOPAINT_PIDS_LIMIT:-256}
+    ports:
+      - "${IOPAINT_PORT:-8080}:8080"
+    volumes:
+      - ${IOPAINT_MODELS_DIR:-/opt/iopaint/models}:/models
+      - ${IOPAINT_OUTPUT_DIR:-/opt/iopaint/output}:/output
+    command: >
+      lama-cleaner
+      --host 0.0.0.0
+      --port 8080
+      --model lama
+      --device cpu
+      --model-dir /models
+      --output-dir /output
+      --disable-model-switch
+      --local-files-only
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/v1/server-config >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 8
+      start_period: 120s

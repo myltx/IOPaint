@@ -1,0 +1,42 @@
+{
+  "name": "iopaint-desktop",
+  "version": "1.0.1",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "dist": "electron-builder --mac --arm64"
+  },
+  "devDependencies": {
+    "electron": "30.1.0",
+    "electron-builder": "24.13.3"
+  },
+  "build": {
+    "appId": "local.iopaint.desktop",
+    "productName": "IOPaint",
+    "directories": {
+      "output": "dist_electron"
+    },
+    "icon": "icon.icns",
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "backend",
+        "to": "backend"
+      }
+    ],
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "identity": null,
+      "icon": "icon.icns"
+    },
+    "dmg": {
+      "sign": false
+    }
+  }
+}
