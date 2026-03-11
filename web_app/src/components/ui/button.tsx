@@ -65,7 +65,7 @@ export interface IconButtonProps extends ButtonProps {
 }
 
 const IconButton = React.forwardRef<HTMLButtonElement, IconButtonProps>(
-  ({ tooltip, children, ...rest }, ref) => {
+  ({ tooltip, children, className, ...rest }, ref) => {
     return (
       <Tooltip>
         <TooltipTrigger asChild>
@@ -75,7 +75,7 @@ const IconButton = React.forwardRef<HTMLButtonElement, IconButtonProps>(
             {...rest}
             ref={ref}
             tabIndex={-1}
-            className="cursor-default bg-background"
+            className={cn("cursor-default bg-background", className)}
           >
             <div className="icon-button-icon-wrapper">{children}</div>
           </Button>

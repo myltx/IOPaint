@@ -1060,10 +1060,19 @@ export default function Editor(props: EditorProps) {
             <Redo />
           </IconButton>
           <IconButton
-            tooltip="Toggle before/after compare"
+            tooltip={
+              isCompareMode
+                ? "Exit before/after compare"
+                : "Enter before/after compare"
+            }
             onClick={() => {
               setIsCompareMode((prev) => !prev)
             }}
+            aria-pressed={isCompareMode}
+            className={cn(
+              isCompareMode &&
+                "bg-primary text-primary-foreground hover:bg-primary/90"
+            )}
             disabled={renders.length === 0}
           >
             <Eye />
