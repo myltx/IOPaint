@@ -9,5 +9,9 @@ contextBridge.exposeInMainWorld("iopaintDesktop", {
   selectOutputDir: () => ipcRenderer.invoke("desktop:select-output-dir"),
   openOutputDir: () => ipcRenderer.invoke("desktop:open-output-dir"),
   openDataDir: () => ipcRenderer.invoke("desktop:open-data-dir"),
-  cleanup: (target) => ipcRenderer.invoke("desktop:cleanup", target)
+  cleanup: (target) => ipcRenderer.invoke("desktop:cleanup", target),
+  getModelDownloadStatus: () =>
+    ipcRenderer.invoke("desktop:get-model-download-status"),
+  startModelDownload: (modelName) =>
+    ipcRenderer.invoke("desktop:start-model-download", modelName)
 });

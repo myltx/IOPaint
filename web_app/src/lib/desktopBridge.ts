@@ -50,6 +50,30 @@ export interface DesktopDataOverviewResult {
   overview?: DesktopDataOverview
 }
 
+export interface DesktopModelDownloadStatus {
+  running: boolean
+  modelName: string | null
+  startedAt: number | null
+  endedAt: number | null
+  exitCode: number | null
+  error: string | null
+  logFile: string | null
+  pid: number | null
+  logTail: string
+}
+
+export interface DesktopModelDownloadStatusResult {
+  ok: boolean
+  error?: string | null
+  status?: DesktopModelDownloadStatus
+}
+
+export interface DesktopStartModelDownloadResult {
+  ok: boolean
+  error?: string | null
+  status?: DesktopModelDownloadStatus
+}
+
 interface DesktopBridge {
   isDesktop: boolean
   getRuntimeInfo: () => Promise<DesktopRuntimeInfo>
@@ -58,6 +82,10 @@ interface DesktopBridge {
   openOutputDir: () => Promise<DesktopActionResult>
   openDataDir: () => Promise<DesktopActionResult>
   cleanup: (target: DesktopCleanupTarget) => Promise<DesktopActionResult>
+  getModelDownloadStatus: () => Promise<DesktopModelDownloadStatusResult>
+  startModelDownload: (
+    modelName: string
+  ) => Promise<DesktopStartModelDownloadResult>
 }
 
 function getBridge(): DesktopBridge | null {
@@ -119,4 +147,28 @@ export async function cleanupDesktopData(
     return { ok: false, error: "Desktop bridge unavailable" }
   }
   return bridge.cleanup(target)
+}
+
+export async function getDesktopModelDownloadStatus(): Promise<DesktopModelDownloadStatusResult> {
+  const bridge = getBridge()
+  if (!bridge) {
+    return { ok: false, error: "Desktop bridge unavailable" }
+  }
+  if (typeof bridge.getModelDownloadStatus !== "function") {
+    return { ok: false, error: "Desktop bridge method missing: getModelDownloadStatus" }
+  }
+  return bridge.getModelDownloadStatus()
+}
+
+export async function startDesktopModelDownload(
+  modelName: string
+): Promise<DesktopStartModelDownloadResult> {
+  const bridge = getBridge()
+  if (!bridge) {
+    return { ok: false, error: "Desktop bridge unavailable" }
+  }
+  if (typeof bridge.startModelDownload !== "function") {
+    return { ok: false, error: "Desktop bridge method missing: startModelDownload" }
+  }
+  return bridge.startModelDownload(modelName)
 }

@@ -12,11 +12,27 @@ const DEFAULT_MODEL = process.env.IOPAINT_MODEL || "lama";
 const DEFAULT_DEVICE = process.env.IOPAINT_DEVICE || "mps";
 const DEFAULT_HOST = process.env.IOPAINT_HOST || "127.0.0.1";
 const START_TIMEOUT_MS = Number(process.env.IOPAINT_START_TIMEOUT_MS || "120000");
+const DISABLE_HARDWARE_ACCELERATION = process.env.IOPAINT_DISABLE_GPU !== "0";
+const HF_MIRROR_ENDPOINT = process.env.IOPAINT_HF_MIRROR || "https://hf-mirror.com";
 
 let backendProc = null;
 let backendPort = null;
 let mainWindow = null;
 let dataPaths = null;
+let modelDownloadProc = null;
+let modelDownloadState = {
+  running: false,
+  modelName: null,
+  startedAt: null,
+  endedAt: null,
+  exitCode: null,
+  error: null,
+  logFile: null
+};
+
+if (DISABLE_HARDWARE_ACCELERATION) {
+  app.disableHardwareAcceleration();
+}
 
 function resolveBackendPaths() {
   const base = app.isPackaged ? process.resourcesPath : __dirname;
@@ -154,6 +170,14 @@ function resolvePython(paths) {
     };
   }
 
+  if (app.isPackaged) {
+    throw new Error(
+      `Bundled Python runtime not found or unusable:\n` +
+      `- bundled: ${runtimePythonPath}\n` +
+      `请重新安装最新版 dmg（必须包含 backend/runtime）。`
+    );
+  }
+
   if (isPythonUsable(fallbackPythonPath)) {
     return {
       pythonPath: fallbackPythonPath,
@@ -255,6 +279,37 @@ function buildBackendErrorMessage(prefix, logFile, tail) {
   );
 }
 
+function inferModelDownloadHint(tail) {
+  const text = tail || "";
+  if (/No space left on device|Errno 28/i.test(text)) {
+    return "磁盘空间不足。请释放磁盘空间后重试。";
+  }
+  if (/Permission denied|Errno 13/i.test(text)) {
+    return "模型目录权限不足。请检查数据目录权限后重试。";
+  }
+  if (/401 Client Error|403 Client Error|Repository Not Found|gated repo|restricted/i.test(text)) {
+    return "模型仓库访问受限。请确认模型名称、权限或 HuggingFace 登录状态。";
+  }
+  if (/NotOpenSSLWarning|LibreSSL/i.test(text)) {
+    return "当前 Python SSL 环境较旧，建议更新打包 runtime（OpenSSL 1.1.1+）。";
+  }
+  if (
+    /Couldn.t connect to the Hub|MaxRetryError|NameResolutionError|Failed to resolve|ConnectionError|ProxyError|SSLError|SSLEOFError|CERTIFICATE_VERIFY_FAILED/i.test(
+      text
+    )
+  ) {
+    return "无法连接 HuggingFace。请检查网络/代理配置；应用已自动尝试镜像重试一次。";
+  }
+  return "";
+}
+
+function shouldRetryModelDownloadWithMirror(tail) {
+  const text = tail || "";
+  return /Couldn.t connect to the Hub|MaxRetryError|NameResolutionError|Failed to resolve|ConnectionError|ProxyError|SSLError|SSLEOFError|CERTIFICATE_VERIFY_FAILED/i.test(
+    text
+  );
+}
+
 function scanDirSummary(rootDir, maxRecentFiles = 8) {
   const result = {
     path: rootDir,
@@ -328,6 +383,18 @@ function tailFile(logFile, maxLines = 50, maxBytes = 65536) {
     return lines.slice(-maxLines).join("\n");
   } catch (err) {
     return "";
+  }
+}
+
+function appendRendererLog(message) {
+  try {
+    const baseLogDir = dataPaths?.logDir || path.join(app.getPath("userData"), "logs");
+    ensureDir(baseLogDir);
+    const logFile = path.join(baseLogDir, "renderer.log");
+    const line = `[${new Date().toISOString()}] ${message}\n`;
+    fs.appendFileSync(logFile, line);
+  } catch (err) {
+    // ignore renderer log write failure
   }
 }
 
@@ -491,6 +558,19 @@ function stopBackend() {
   }, 3000);
 }
 
+function stopModelDownload() {
+  if (!modelDownloadProc) {
+    return;
+  }
+  const proc = modelDownloadProc;
+  modelDownloadProc = null;
+  try {
+    proc.kill("SIGTERM");
+  } catch (err) {
+    // ignore
+  }
+}
+
 async function restartBackend() {
   if (!backendPort || !dataPaths) {
     return;
@@ -560,6 +640,152 @@ function clearLogFiles() {
   }
 }
 
+function getModelDownloadStatus() {
+  return {
+    ...modelDownloadState,
+    pid: modelDownloadProc ? modelDownloadProc.pid : null,
+    logTail: modelDownloadState.logFile
+      ? tailFile(modelDownloadState.logFile, 80, 131072)
+      : ""
+  };
+}
+
+function startModelDownload(modelNameInput) {
+  if (!dataPaths) {
+    throw new Error("Data paths not initialized");
+  }
+  if (modelDownloadProc) {
+    throw new Error(
+      `已有下载任务进行中: ${modelDownloadState.modelName || "unknown"}`
+    );
+  }
+
+  const modelName = String(modelNameInput || "").trim();
+  if (!modelName) {
+    throw new Error("模型名称不能为空");
+  }
+
+  const paths = resolveBackendPaths();
+  const mainPy = path.join(paths.backendSrc, "main.py");
+  if (!fs.existsSync(mainPy)) {
+    throw new Error(`后端入口不存在: ${mainPy}`);
+  }
+
+  assertWritableDir(dataPaths.modelDir, "模型目录");
+  assertWritableDir(dataPaths.logDir, "日志目录");
+
+  const python = resolvePython(paths);
+  const env = buildPythonEnv(paths, dataPaths, python.runtimeSitePackages);
+  // Download command needs online mode even if backend runtime uses local-files-only.
+  env.TRANSFORMERS_OFFLINE = "0";
+  env.HF_HUB_OFFLINE = "0";
+
+  const logFile = path.join(
+    dataPaths.logDir,
+    `model-download-${Date.now()}.log`
+  );
+  const logStream = fs.createWriteStream(logFile, { flags: "a" });
+  const args = [
+    mainPy,
+    "download",
+    "--model",
+    modelName,
+    "--model-dir",
+    dataPaths.modelDir
+  ];
+
+  modelDownloadState = {
+    running: true,
+    modelName,
+    startedAt: Date.now(),
+    endedAt: null,
+    exitCode: null,
+    error: null,
+    logFile
+  };
+  let hasRetriedWithMirror = false;
+
+  const startAttempt = (attemptEnv, attemptLabel) => {
+    const proc = spawn(python.pythonPath, args, {
+      cwd: paths.backendSrc,
+      env: attemptEnv,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    modelDownloadProc = proc;
+
+    proc.stdout.pipe(logStream, { end: false });
+    proc.stderr.pipe(logStream, { end: false });
+
+    let settled = false;
+    const finalize = (exitCode, errorMessage) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      modelDownloadState = {
+        ...modelDownloadState,
+        running: false,
+        endedAt: Date.now(),
+        exitCode,
+        error: errorMessage
+      };
+      modelDownloadProc = null;
+      logStream.end();
+    };
+
+    proc.on("error", (err) => {
+      finalize(-1, String(err));
+    });
+
+    proc.on("exit", (code, signal) => {
+      if (signal) {
+        finalize(typeof code === "number" ? code : null, `下载进程被信号终止: ${signal}`);
+        return;
+      }
+      if (code === 0) {
+        finalize(0, null);
+        return;
+      }
+
+      const tail = tailFile(logFile, 120, 262144);
+      if (
+        !hasRetriedWithMirror &&
+        !attemptEnv.HF_ENDPOINT &&
+        shouldRetryModelDownloadWithMirror(tail)
+      ) {
+        hasRetriedWithMirror = true;
+        try {
+          logStream.write(
+            `\n[desktop] Download failed on ${attemptLabel}, retry with HF mirror: ${HF_MIRROR_ENDPOINT}\n\n`
+          );
+        } catch (err) {
+          // ignore log write error
+        }
+        modelDownloadState = {
+          ...modelDownloadState,
+          running: true,
+          endedAt: null,
+          exitCode: null,
+          error: "首次下载失败，正在使用镜像重试..."
+        };
+        startAttempt({ ...attemptEnv, HF_ENDPOINT: HF_MIRROR_ENDPOINT }, "mirror");
+        return;
+      }
+
+      const hint = inferModelDownloadHint(tail);
+      const endpointSuffix = attemptEnv.HF_ENDPOINT
+        ? `，HF_ENDPOINT=${attemptEnv.HF_ENDPOINT}`
+        : "";
+      const errorMessage = hint
+        ? `下载失败，退出码 ${code}${endpointSuffix}。${hint}`
+        : `下载失败，退出码 ${code}${endpointSuffix}`;
+      finalize(typeof code === "number" ? code : null, errorMessage);
+    });
+  };
+
+  startAttempt(env, "primary");
+}
+
 async function clearModelCacheAndRestart() {
   if (!dataPaths) {
     throw new Error("Data paths not initialized");
@@ -622,6 +848,39 @@ function createWindow() {
     Buffer.from(splashContent, "utf8").toString("base64");
   mainWindow.loadURL(splashHtml);
   mainWindow.once("ready-to-show", () => mainWindow.show());
+  mainWindow.webContents.on("did-fail-load", (_event, code, desc, url) => {
+    const message = `did-fail-load code=${code} desc=${desc} url=${url}`;
+    appendRendererLog(message);
+    dialog.showErrorBox(`${APP_NAME} 页面加载失败`, message);
+  });
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    const message =
+      `render-process-gone reason=${details.reason} ` +
+      `exitCode=${details.exitCode}`;
+    appendRendererLog(message);
+    dialog.showErrorBox(`${APP_NAME} 渲染进程异常`, message);
+  });
+  mainWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    appendRendererLog(
+      `console level=${level} source=${sourceId}:${line} message=${message}`
+    );
+  });
+  mainWindow.webContents.on("did-finish-load", () => {
+    appendRendererLog(`did-finish-load url=${mainWindow.webContents.getURL()}`);
+    void mainWindow.webContents
+      .executeJavaScript(
+        "({ title: document.title || '', bodyClass: document.body?.className || '', textLen: (document.body?.innerText || '').trim().length })",
+        true
+      )
+      .then((summary) => {
+        appendRendererLog(
+          `dom-summary title=${summary.title} bodyClass=${summary.bodyClass} textLen=${summary.textLen}`
+        );
+      })
+      .catch((err) => {
+        appendRendererLog(`dom-summary-failed error=${String(err)}`);
+      });
+  });
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
@@ -742,6 +1001,23 @@ function registerIpcHandlers() {
       return { ok: false, error: String(err) };
     }
   });
+
+  ipcMain.handle("desktop:get-model-download-status", () => {
+    try {
+      return { ok: true, status: getModelDownloadStatus() };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
+
+  ipcMain.handle("desktop:start-model-download", (_event, modelName) => {
+    try {
+      startModelDownload(modelName);
+      return { ok: true, status: getModelDownloadStatus() };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
 }
 
 async function boot() {
@@ -772,6 +1048,7 @@ async function boot() {
 
 app.on("before-quit", () => {
   stopBackend();
+  stopModelDownload();
 });
 
 app.on("window-all-closed", () => {

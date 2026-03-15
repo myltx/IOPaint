@@ -50,6 +50,30 @@ interface DesktopDataOverviewResult {
   overview?: DesktopDataOverview
 }
 
+interface DesktopModelDownloadStatus {
+  running: boolean
+  modelName: string | null
+  startedAt: number | null
+  endedAt: number | null
+  exitCode: number | null
+  error: string | null
+  logFile: string | null
+  pid: number | null
+  logTail: string
+}
+
+interface DesktopModelDownloadStatusResult {
+  ok: boolean
+  error?: string | null
+  status?: DesktopModelDownloadStatus
+}
+
+interface DesktopStartModelDownloadResult {
+  ok: boolean
+  error?: string | null
+  status?: DesktopModelDownloadStatus
+}
+
 type DesktopCleanupTarget = "logs" | "models" | "all"
 
 interface Window {
@@ -61,5 +85,9 @@ interface Window {
     openOutputDir: () => Promise<DesktopActionResult>
     openDataDir: () => Promise<DesktopActionResult>
     cleanup: (target: DesktopCleanupTarget) => Promise<DesktopActionResult>
+    getModelDownloadStatus: () => Promise<DesktopModelDownloadStatusResult>
+    startModelDownload: (
+      modelName: string
+    ) => Promise<DesktopStartModelDownloadResult>
   }
 }

@@ -27,13 +27,16 @@ import {
   cleanupDesktopData,
   DesktopCleanupTarget,
   DesktopDataOverview,
+  DesktopModelDownloadStatus,
   DesktopRuntimeInfo,
   getDesktopDataOverview,
+  getDesktopModelDownloadStatus,
   getDesktopRuntimeInfo,
   isDesktopBridgeAvailable,
   openDesktopDataDir,
   openDesktopOutputDir,
   selectDesktopOutputDir,
+  startDesktopModelDownload,
 } from "@/lib/desktopBridge"
 import {
   AppLocale,
@@ -85,6 +88,25 @@ const TAB_PLUGINS = "plugins"
 const TAB_DATA = "data"
 
 const BASE_TAB_NAMES = [TAB_MODEL, TAB_GENERAL, TAB_PLUGINS]
+const DEFAULT_DESKTOP_DOWNLOAD_MODEL =
+  "Sanster/PowerPaint-V1-stable-diffusion-inpainting"
+const DESKTOP_DOWNLOAD_MODEL_OPTIONS = [
+  {
+    value: "Sanster/PowerPaint-V1-stable-diffusion-inpainting",
+    zhLabel: "PowerPaint V1（推荐）",
+    enLabel: "PowerPaint V1 (Recommended)",
+  },
+  {
+    value: "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+    zhLabel: "SDXL Inpainting",
+    enLabel: "SDXL Inpainting",
+  },
+  {
+    value: "runwayml/stable-diffusion-inpainting",
+    zhLabel: "SD 1.5 Inpainting",
+    enLabel: "SD 1.5 Inpainting",
+  },
+]
 
 function formatBytes(bytes: number) {
   if (!Number.isFinite(bytes) || bytes <= 0) {
@@ -133,9 +155,19 @@ export function SettingsDialog() {
     useState<DesktopRuntimeInfo | null>(null)
   const [desktopDataOverview, setDesktopDataOverview] =
     useState<DesktopDataOverview | null>(null)
+  const [desktopDownloadStatus, setDesktopDownloadStatus] =
+    useState<DesktopModelDownloadStatus | null>(null)
+  const [desktopDownloadModel, setDesktopDownloadModel] = useState(
+    DEFAULT_DESKTOP_DOWNLOAD_MODEL
+  )
   const [isLoadingDesktopData, setIsLoadingDesktopData] = useState(false)
   const [desktopBusyAction, setDesktopBusyAction] = useState<
-    DesktopCleanupTarget | "open_output" | "open_data" | "set_output" | null
+    | DesktopCleanupTarget
+    | "open_output"
+    | "open_data"
+    | "set_output"
+    | "download_model"
+    | null
   >(null)
   const [locale, setLocale] = useState<AppLocale>(() => getPreferredLocale())
   const desktopSupported = isDesktopBridgeAvailable()
@@ -182,15 +214,23 @@ export function SettingsDialog() {
   }, [form, serverConfig])
 
   useEffect(() => {
+    if (!open) {
+      return
+    }
     if (!desktopSupported) {
       setDesktopRuntimeInfo(null)
       setDesktopDataOverview(null)
+      setDesktopDownloadStatus(null)
       return
     }
     let cancelled = false
     setIsLoadingDesktopData(true)
-    Promise.all([getDesktopRuntimeInfo(), getDesktopDataOverview()])
-      .then(([runtimeInfo, overviewResult]) => {
+    Promise.all([
+      getDesktopRuntimeInfo(),
+      getDesktopDataOverview(),
+      getDesktopModelDownloadStatus(),
+    ])
+      .then(([runtimeInfo, overviewResult, downloadResult]) => {
         if (cancelled) {
           return
         }
@@ -200,11 +240,17 @@ export function SettingsDialog() {
         } else {
           setDesktopDataOverview(null)
         }
+        if (downloadResult.ok && downloadResult.status) {
+          setDesktopDownloadStatus(downloadResult.status)
+        } else {
+          setDesktopDownloadStatus(null)
+        }
       })
       .catch(() => {
         if (!cancelled) {
           setDesktopRuntimeInfo(null)
           setDesktopDataOverview(null)
+          setDesktopDownloadStatus(null)
         }
       })
       .finally(() => {
@@ -222,6 +268,41 @@ export function SettingsDialog() {
       setTab(TAB_MODEL)
     }
   }, [desktopSupported, tab])
+
+  useEffect(() => {
+    if (!open || !desktopSupported || !desktopRuntimeInfo?.isDesktop) {
+      return
+    }
+    if (!desktopDownloadStatus?.running) {
+      return
+    }
+    let cancelled = false
+    const timer = setInterval(() => {
+      if (cancelled) {
+        return
+      }
+      void getDesktopModelDownloadStatus().then((result) => {
+        if (cancelled || !result.ok || !result.status) {
+          return
+        }
+        setDesktopDownloadStatus(result.status)
+        if (!result.status.running && result.status.exitCode === 0) {
+          void refetch()
+        }
+      })
+    }, 2000)
+
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [
+    desktopDownloadStatus?.running,
+    desktopRuntimeInfo?.isDesktop,
+    desktopSupported,
+    open,
+    refetch,
+  ])
 
   function tabLabel(tabName: string) {
     if (tabName === TAB_MODEL) {
@@ -517,13 +598,15 @@ export function SettingsDialog() {
     if (!desktopSupported) {
       setDesktopRuntimeInfo(null)
       setDesktopDataOverview(null)
+      setDesktopDownloadStatus(null)
       return
     }
     setIsLoadingDesktopData(true)
     try {
-      const [runtimeInfo, overviewResult] = await Promise.all([
+      const [runtimeInfo, overviewResult, downloadResult] = await Promise.all([
         getDesktopRuntimeInfo(),
         getDesktopDataOverview(),
+        getDesktopModelDownloadStatus(),
       ])
       setDesktopRuntimeInfo(runtimeInfo)
       if (overviewResult.ok && overviewResult.overview) {
@@ -531,9 +614,15 @@ export function SettingsDialog() {
       } else {
         setDesktopDataOverview(null)
       }
+      if (downloadResult.ok && downloadResult.status) {
+        setDesktopDownloadStatus(downloadResult.status)
+      } else {
+        setDesktopDownloadStatus(null)
+      }
     } catch {
       setDesktopRuntimeInfo(null)
       setDesktopDataOverview(null)
+      setDesktopDownloadStatus(null)
     } finally {
       setIsLoadingDesktopData(false)
     }
@@ -633,6 +722,38 @@ export function SettingsDialog() {
       toast({
         variant: "destructive",
         title: t(locale, "清理失败", "Cleanup failed"),
+        description: error?.message ? error.message : String(error),
+      })
+    } finally {
+      setDesktopBusyAction(null)
+    }
+  }
+
+  async function handleDesktopStartModelDownload() {
+    const modelName = desktopDownloadModel.trim()
+    if (!modelName) {
+      toast({
+        variant: "destructive",
+        title: t(locale, "模型名不能为空", "Model name cannot be empty"),
+      })
+      return
+    }
+
+    setDesktopBusyAction("download_model")
+    try {
+      const result = await startDesktopModelDownload(modelName)
+      if (!result.ok || !result.status) {
+        throw new Error(result.error || "Failed to start model download")
+      }
+      setDesktopDownloadStatus(result.status)
+      toast({
+        title: t(locale, "已开始下载模型", "Model download started"),
+        description: t(locale, `模型：${modelName}`, `Model: ${modelName}`),
+      })
+    } catch (error: any) {
+      toast({
+        variant: "destructive",
+        title: t(locale, "下载启动失败", "Failed to start download"),
         description: error?.message ? error.message : String(error),
       })
     } finally {
@@ -844,6 +965,88 @@ export function SettingsDialog() {
                   {t(locale, "清理全部应用数据", "Clear All App Data")}
                 </Button>
               </div>
+            </div>
+
+            <Separator />
+
+            <div className="space-y-2">
+              <div className="font-medium">{t(locale, "模型下载", "Model Download")}</div>
+              <div className="text-xs text-muted-foreground">
+                {t(
+                  locale,
+                  "安装后可在这里下载高质量模型。下载完成后可在模型列表里切换使用。",
+                  "Download high-quality models here after installation. You can switch to them in model list after download."
+                )}
+              </div>
+              <div className="flex gap-2">
+                <Select
+                  value={desktopDownloadModel}
+                  onValueChange={(value) => setDesktopDownloadModel(value)}
+                  disabled={
+                    desktopBusyAction !== null ||
+                    Boolean(desktopDownloadStatus?.running)
+                  }
+                >
+                  <SelectTrigger className="flex-1">
+                    <SelectValue
+                      placeholder={t(locale, "选择要下载的模型", "Select model")}
+                    />
+                  </SelectTrigger>
+                  <SelectContent align="start">
+                    <SelectGroup>
+                      {DESKTOP_DOWNLOAD_MODEL_OPTIONS.map((item) => (
+                        <SelectItem key={item.value} value={item.value}>
+                          {t(locale, item.zhLabel, item.enLabel)}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={
+                    desktopBusyAction !== null ||
+                    Boolean(desktopDownloadStatus?.running)
+                  }
+                  onClick={() => {
+                    void handleDesktopStartModelDownload()
+                  }}
+                >
+                  {desktopDownloadStatus?.running
+                    ? t(locale, "下载中...", "Downloading...")
+                    : t(locale, "下载模型", "Download Model")}
+                </Button>
+              </div>
+              <div className="text-xs text-muted-foreground">
+                {desktopDownloadStatus?.running
+                  ? t(
+                      locale,
+                      `状态：下载中（${desktopDownloadStatus.modelName || "-"})`,
+                      `Status: Downloading (${desktopDownloadStatus.modelName || "-"})`
+                    )
+                  : desktopDownloadStatus?.endedAt
+                  ? desktopDownloadStatus.exitCode === 0
+                    ? t(locale, "状态：下载完成", "Status: Download completed")
+                    : t(
+                        locale,
+                        `状态：下载失败（${desktopDownloadStatus.error || "未知错误"}）`,
+                        `Status: Download failed (${desktopDownloadStatus.error || "unknown error"})`
+                      )
+                  : t(locale, "状态：未开始", "Status: Not started")}
+              </div>
+              {desktopDownloadStatus?.logFile ? (
+                <div className="space-y-1">
+                  <div className="text-xs text-muted-foreground break-all">
+                    {t(locale, "日志文件", "Log file")}：{desktopDownloadStatus.logFile}
+                  </div>
+                  <pre className="text-[11px] max-h-[140px] overflow-auto rounded border p-2 bg-muted/40 whitespace-pre-wrap break-all">
+                    {desktopDownloadStatus.logTail
+                      ? desktopDownloadStatus.logTail
+                      : t(locale, "暂无日志输出", "No logs yet")}
+                  </pre>
+                </div>
+              ) : null}
             </div>
           </>
         ) : (
